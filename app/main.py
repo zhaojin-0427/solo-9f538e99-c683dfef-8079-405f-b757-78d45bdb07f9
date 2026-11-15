@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Path as PathParam, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import config, db
@@ -55,7 +56,13 @@ async def _csv_error_handler(_request, exc: CsvValidationError) -> JSONResponse:
         content={
             "error": "validation_failed",
             "message": "整批数据未通过校验，没有任何记录被发布",
+            # Verbatim details are capped at the first 100 per-row errors;
+            # the totals below are always exact and complete.
             "reasons": exc.reasons,
+            "error_counts": exc.error_counts,
+            "total_errors": exc.total_errors,
+            "missing_hours": exc.missing_hours,
+            "details_truncated": exc.details_truncated,
         },
     )
 
@@ -106,7 +113,10 @@ async def upload_batch(
         raise HTTPException(status_code=413, detail="上传文件超过 5 MiB 限制")
 
     # Raises CsvValidationError -> 422 with per-row / per-hour reasons.
-    batch = parse_and_validate(raw)
+    # Validation is CPU-bound and can take seconds for a pathological
+    # within-limit file (e.g. ~1M duplicate rows); run it in a worker
+    # thread so queries of other stations/dates stay responsive meanwhile.
+    batch = await run_in_threadpool(parse_and_validate, raw)
 
     result = db.publish_batch(station_id, data_date, expected_version, batch)
     result["replaced"] = expected_version != 0
